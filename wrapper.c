@@ -1,8 +1,22 @@
 /*
  * Various trivial helper wrappers around standard functions
  */
-#include "cache.h"
-#include "config.h"
+
+#define DISABLE_SIGN_COMPARE_WARNINGS
+
+#include "git-compat-util.h"
+#include "abspath.h"
+#include "parse.h"
+#include "gettext.h"
+#include "strbuf.h"
+#include "trace2.h"
+
+#ifdef HAVE_RTLGENRANDOM
+/* This is required to get access to RtlGenRandom. */
+#define SystemFunction036 NTAPI SystemFunction036
+#include <ntsecapi.h>
+#undef SystemFunction036
+#endif
 
 static int memory_limit_check(size_t size, int gentle)
 {
@@ -150,28 +164,6 @@ void xsetenv(const char *name, const char *value, int overwrite)
 	if (setenv(name, value, overwrite))
 		die_errno(_("could not setenv '%s'"), name ? name : "(null)");
 }
-
-/*
- * Limit size of IO chunks, because huge chunks only cause pain.  OS X
- * 64-bit is buggy, returning EINVAL if len >= INT_MAX; and even in
- * the absence of bugs, large chunks can result in bad latencies when
- * you decide to kill the process.
- *
- * We pick 8 MiB as our default, but if the platform defines SSIZE_MAX
- * that is smaller than that, clip it to SSIZE_MAX, as a call to
- * read(2) or write(2) larger than that is allowed to fail.  As the last
- * resort, we allow a port to pass via CFLAGS e.g. "-DMAX_IO_SIZE=value"
- * to override this, if the definition of SSIZE_MAX given by the platform
- * is broken.
- */
-#ifndef MAX_IO_SIZE
-# define MAX_IO_SIZE_DEFAULT (8*1024*1024)
-# if defined(SSIZE_MAX) && (SSIZE_MAX < MAX_IO_SIZE_DEFAULT)
-#  define MAX_IO_SIZE SSIZE_MAX
-# else
-#  define MAX_IO_SIZE MAX_IO_SIZE_DEFAULT
-# endif
-#endif
 
 /**
  * xopen() is the same as open(), but it die()s if the open() fails.
@@ -383,7 +375,7 @@ FILE *xfopen(const char *path, const char *mode)
 FILE *xfdopen(int fd, const char *mode)
 {
 	FILE *stream = fdopen(fd, mode);
-	if (stream == NULL)
+	if (!stream)
 		die_errno("Out of memory? fdopen failed");
 	return stream;
 }
@@ -539,6 +531,73 @@ int xmkstemp_mode(char *filename_template, int mode)
 	return fd;
 }
 
+/*
+ * Some platforms return EINTR from fsync. Since fsync is invoked in some
+ * cases by a wrapper that dies on failure, do not expose EINTR to callers.
+ */
+static int fsync_loop(int fd)
+{
+	int err;
+
+	do {
+		err = fsync(fd);
+	} while (err < 0 && errno == EINTR);
+	return err;
+}
+
+int git_fsync(int fd, enum fsync_action action)
+{
+	switch (action) {
+	case FSYNC_WRITEOUT_ONLY:
+		trace2_counter_add(TRACE2_COUNTER_ID_FSYNC_WRITEOUT_ONLY, 1);
+
+#ifdef __APPLE__
+		/*
+		 * On macOS, fsync just causes filesystem cache writeback but
+		 * does not flush hardware caches.
+		 */
+		return fsync_loop(fd);
+#endif
+
+#ifdef HAVE_SYNC_FILE_RANGE
+		/*
+		 * On linux 2.6.17 and above, sync_file_range is the way to
+		 * issue a writeback without a hardware flush. An offset of
+		 * 0 and size of 0 indicates writeout of the entire file and the
+		 * wait flags ensure that all dirty data is written to the disk
+		 * (potentially in a disk-side cache) before we continue.
+		 */
+
+		return sync_file_range(fd, 0, 0, SYNC_FILE_RANGE_WAIT_BEFORE |
+						 SYNC_FILE_RANGE_WRITE |
+						 SYNC_FILE_RANGE_WAIT_AFTER);
+#endif
+
+#ifdef fsync_no_flush
+		return fsync_no_flush(fd);
+#endif
+
+		errno = ENOSYS;
+		return -1;
+
+	case FSYNC_HARDWARE_FLUSH:
+		trace2_counter_add(TRACE2_COUNTER_ID_FSYNC_HARDWARE_FLUSH, 1);
+
+		/*
+		 * On macOS, a special fcntl is required to really flush the
+		 * caches within the storage controller. As of this writing,
+		 * this is a very expensive operation on Apple SSDs.
+		 */
+#ifdef __APPLE__
+		return fcntl(fd, F_FULLFSYNC);
+#else
+		return fsync_loop(fd);
+#endif
+	default:
+		BUG("unexpected git_fsync(%d) call", action);
+	}
+}
+
 static int warn_if_unremovable(const char *op, const char *file, int rc)
 {
 	int err;
@@ -572,11 +631,6 @@ int unlink_or_warn(const char *file)
 int rmdir_or_warn(const char *file)
 {
 	return warn_if_unremovable("rmdir", file, rmdir(file));
-}
-
-int remove_or_warn(unsigned int mode, const char *file)
-{
-	return S_ISGITLINK(mode) ? rmdir_or_warn(file) : unlink_or_warn(file);
 }
 
 static int access_error_is_ok(int err, unsigned flag)
@@ -619,7 +673,7 @@ int xsnprintf(char *dst, size_t max, const char *fmt, ...)
 	va_end(ap);
 
 	if (len < 0)
-		BUG("your snprintf is broken");
+		die(_("unable to format message: %s"), fmt);
 	if (len >= max)
 		BUG("attempt to snprintf into too-small buffer");
 	return len;
@@ -760,4 +814,14 @@ int csprng_bytes(void *buf, size_t len)
 	close(fd);
 	return 0;
 #endif
+}
+
+uint32_t git_rand(void)
+{
+	uint32_t result;
+
+	if (csprng_bytes(&result, sizeof(result)) < 0)
+		die(_("unable to get random bytes"));
+
+	return result;
 }

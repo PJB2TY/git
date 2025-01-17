@@ -9,6 +9,7 @@ GIT_TEST_DEFAULT_INITIAL_BRANCH_NAME=main
 export GIT_TEST_DEFAULT_INITIAL_BRANCH_NAME
 
 . ./test-lib.sh
+. "$TEST_DIRECTORY"/lib-unique-files.sh
 
 test_expect_success 'usage on cmd and subcommand invalid option' '
 	test_expect_code 129 git stash --invalid-option 2>usage &&
@@ -24,7 +25,7 @@ test_expect_success 'usage on main command -h emits a summary of subcommands' '
 	grep -F "or: git stash show" usage
 '
 
-test_expect_failure 'usage for subcommands should emit subcommand usage' '
+test_expect_success 'usage for subcommands should emit subcommand usage' '
 	test_expect_code 129 git stash push -h >usage &&
 	grep -F "usage: git stash [push" usage
 '
@@ -41,7 +42,7 @@ diff_cmp () {
 	rm -f "$1.compare" "$2.compare"
 }
 
-test_expect_success 'stash some dirty working directory' '
+setup_stash() {
 	echo 1 >file &&
 	git add file &&
 	echo unrelated >other-file &&
@@ -55,6 +56,10 @@ test_expect_success 'stash some dirty working directory' '
 	git stash &&
 	git diff-files --quiet &&
 	git diff-index --cached --quiet HEAD
+}
+
+test_expect_success 'stash some dirty working directory' '
+	setup_stash
 '
 
 cat >expect <<EOF
@@ -185,6 +190,43 @@ test_expect_success 'drop middle stash by index' '
 	test 1 = $(git show HEAD:file)
 '
 
+test_expect_success 'drop stash reflog updates refs/stash' '
+	git reset --hard &&
+	git rev-parse refs/stash >expect &&
+	echo 9 >file &&
+	git stash &&
+	git stash drop stash@{0} &&
+	git rev-parse refs/stash >actual &&
+	test_cmp expect actual
+'
+
+test_expect_success 'drop stash reflog updates refs/stash with rewrite' '
+	git init repo &&
+	(
+		cd repo &&
+		setup_stash
+	) &&
+	echo 9 >repo/file &&
+
+	old_oid="$(git -C repo rev-parse stash@{0})" &&
+	git -C repo stash &&
+	new_oid="$(git -C repo rev-parse stash@{0})" &&
+
+	cat >expect <<-EOF &&
+	$new_oid
+	$old_oid
+	EOF
+	git -C repo reflog show refs/stash --format=%H >actual &&
+	test_cmp expect actual &&
+
+	git -C repo stash drop stash@{1} &&
+	git -C repo reflog show refs/stash --format=%H >actual &&
+	cat >expect <<-EOF &&
+	$new_oid
+	EOF
+	test_cmp expect actual
+'
+
 test_expect_success 'stash pop' '
 	git reset --hard &&
 	git stash pop &&
@@ -261,6 +303,18 @@ test_expect_success 'apply -q is quiet' '
 	test_must_be_empty output.out
 '
 
+test_expect_success 'apply --index -q is quiet' '
+	# Added file, deleted file, modified file all staged for commit
+	echo foo >new-file &&
+	echo test >file &&
+	git add new-file file &&
+	git rm other-file &&
+
+	git stash &&
+	git stash apply --index -q >output.out 2>&1 &&
+	test_must_be_empty output.out
+'
+
 test_expect_success 'save -q is quiet' '
 	git stash save --quiet >output.out 2>&1 &&
 	test_must_be_empty output.out
@@ -291,6 +345,27 @@ test_expect_success 'drop -q is quiet' '
 	test_must_be_empty output.out
 '
 
+test_expect_success 'stash push -q --staged refreshes the index' '
+	git reset --hard &&
+	echo test >file &&
+	git add file &&
+	git stash push -q --staged &&
+	git diff-files >output.out &&
+	test_must_be_empty output.out
+'
+
+test_expect_success 'stash apply -q --index refreshes the index' '
+	echo test >other-file &&
+	git add other-file &&
+	echo another-change >other-file &&
+	git diff-files >expect &&
+	git stash &&
+
+	git stash apply -q --index &&
+	git diff-files >actual &&
+	test_cmp expect actual
+'
+
 test_expect_success 'stash -k' '
 	echo bar3 >file &&
 	echo bar4 >file2 &&
@@ -318,9 +393,18 @@ test_expect_success 'stash --staged' '
 	test bar,bar4 = $(cat file),$(cat file2)
 '
 
+test_expect_success 'stash --staged with binary file' '
+	printf "\0" >file &&
+	git add file &&
+	git stash --staged &&
+	git stash pop &&
+	printf "\0" >expect &&
+	test_cmp expect file
+'
+
 test_expect_success 'dont assume push with non-option args' '
 	test_must_fail git stash -q drop 2>err &&
-	test_i18ngrep -e "subcommand wasn'\''t specified; '\''push'\'' can'\''t be assumed due to unexpected token '\''drop'\''" err
+	test_grep -e "subcommand wasn'\''t specified; '\''push'\'' can'\''t be assumed due to unexpected token '\''drop'\''" err
 '
 
 test_expect_success 'stash --invalid-option' '
@@ -521,7 +605,7 @@ test_expect_success 'giving too many ref arguments does not modify files' '
 	for type in apply pop "branch stash-branch"
 	do
 		test_must_fail git stash $type stash@{0} stash@{1} 2>err &&
-		test_i18ngrep "Too many revisions" err &&
+		test_grep "Too many revisions" err &&
 		test 123456789 = $(test-tool chmtime -g file2) || return 1
 	done
 '
@@ -529,14 +613,14 @@ test_expect_success 'giving too many ref arguments does not modify files' '
 test_expect_success 'drop: too many arguments errors out (does nothing)' '
 	git stash list >expect &&
 	test_must_fail git stash drop stash@{0} stash@{1} 2>err &&
-	test_i18ngrep "Too many revisions" err &&
+	test_grep "Too many revisions" err &&
 	git stash list >actual &&
 	test_cmp expect actual
 '
 
 test_expect_success 'show: too many arguments errors out (does nothing)' '
 	test_must_fail git stash show stash@{0} stash@{1} 2>err 1>out &&
-	test_i18ngrep "Too many revisions" err &&
+	test_grep "Too many revisions" err &&
 	test_must_be_empty out
 '
 
@@ -579,7 +663,7 @@ test_expect_success 'stash branch - stashes on stack, stash-like argument' '
 
 test_expect_success 'stash branch complains with no arguments' '
 	test_must_fail git stash branch 2>err &&
-	test_i18ngrep "No branch name specified" err
+	test_grep "No branch name specified" err
 '
 
 test_expect_success 'stash show format defaults to --stat' '
@@ -854,6 +938,10 @@ test_expect_success 'stash where working directory contains "HEAD" file' '
 
 test_expect_success 'store called with invalid commit' '
 	test_must_fail git stash store foo
+'
+
+test_expect_success 'store called with non-stash commit' '
+	test_must_fail git stash store HEAD
 '
 
 test_expect_success 'store updates stash ref and reflog' '
@@ -1136,19 +1224,19 @@ test_expect_success 'stash with file including $IFS character' '
 '
 
 test_expect_success 'stash with pathspec matching multiple paths' '
-       echo original >file &&
-       echo original >other-file &&
-       git commit -m "two" file other-file &&
-       echo modified >file &&
-       echo modified >other-file &&
-       git stash push -- "*file" &&
-       echo original >expect &&
-       test_cmp expect file &&
-       test_cmp expect other-file &&
-       git stash pop &&
-       echo modified >expect &&
-       test_cmp expect file &&
-       test_cmp expect other-file
+	echo original >file &&
+	echo original >other-file &&
+	git commit -m "two" file other-file &&
+	echo modified >file &&
+	echo modified >other-file &&
+	git stash push -- "*file" &&
+	echo original >expect &&
+	test_cmp expect file &&
+	test_cmp expect other-file &&
+	git stash pop &&
+	echo modified >expect &&
+	test_cmp expect file &&
+	test_cmp expect other-file
 '
 
 test_expect_success 'stash push -p with pathspec shows no changes only once' '
@@ -1309,6 +1397,21 @@ test_expect_success 'stash --keep-index with file deleted in index does not resu
 	test_path_is_missing to-remove
 '
 
+test_expect_success 'stash --keep-index --include-untracked with empty tree' '
+	test_when_finished "rm -rf empty" &&
+	git init empty &&
+	(
+		cd empty &&
+		git commit --allow-empty --message "empty" &&
+		echo content >file &&
+		git stash push --keep-index --include-untracked &&
+		test_path_is_missing file &&
+		git stash pop &&
+		echo content >expect &&
+		test_cmp expect file
+	)
+'
+
 test_expect_success 'stash apply should succeed with unmodified file' '
 	echo base >file &&
 	git add file &&
@@ -1335,6 +1438,25 @@ test_expect_success 'stash handles skip-worktree entries nicely' '
 
 	git rev-parse --verify refs/stash:A.t
 '
+
+
+BATCH_CONFIGURATION='-c core.fsync=loose-object -c core.fsyncmethod=batch'
+
+test_expect_success 'stash with core.fsyncmethod=batch' "
+	test_create_unique_files 2 4 files_base_dir &&
+	GIT_TEST_FSYNC=1 git $BATCH_CONFIGURATION stash push -u -- ./files_base_dir/ &&
+
+	# The files were untracked, so use the third parent,
+	# which contains the untracked files
+	git ls-tree -r stash^3 -- ./files_base_dir/ |
+	test_parse_ls_tree_oids >stashed_files_oids &&
+
+	# We created 2 dirs with 4 files each (8 files total) above
+	test_line_count = 8 stashed_files_oids &&
+	git cat-file --batch-check='%(objectname)' <stashed_files_oids >stashed_files_actual &&
+	test_cmp stashed_files_oids stashed_files_actual
+"
+
 
 test_expect_success 'git stash succeeds despite directory/file change' '
 	test_create_repo directory_file_switch_v1 &&
@@ -1415,6 +1537,58 @@ test_expect_success 'restore untracked files even when we hit conflicts' '
 		test_must_fail git stash pop &&
 
 		test_path_is_file c
+	)
+'
+
+test_expect_success 'stash create reports a locked index' '
+	test_when_finished "rm -rf repo" &&
+	git init repo &&
+	(
+		cd repo &&
+		test_commit A A.file &&
+		echo change >A.file &&
+		touch .git/index.lock &&
+
+		cat >expect <<-EOF &&
+		error: could not write index
+		EOF
+		test_must_fail git stash create 2>err &&
+		test_cmp expect err
+	)
+'
+
+test_expect_success 'stash push reports a locked index' '
+	test_when_finished "rm -rf repo" &&
+	git init repo &&
+	(
+		cd repo &&
+		test_commit A A.file &&
+		echo change >A.file &&
+		touch .git/index.lock &&
+
+		cat >expect <<-EOF &&
+		error: could not write index
+		EOF
+		test_must_fail git stash push 2>err &&
+		test_cmp expect err
+	)
+'
+
+test_expect_success 'stash apply reports a locked index' '
+	test_when_finished "rm -rf repo" &&
+	git init repo &&
+	(
+		cd repo &&
+		test_commit A A.file &&
+		echo change >A.file &&
+		git stash push &&
+		touch .git/index.lock &&
+
+		cat >expect <<-EOF &&
+		error: could not write index
+		EOF
+		test_must_fail git stash apply 2>err &&
+		test_cmp expect err
 	)
 '
 

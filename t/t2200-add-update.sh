@@ -14,7 +14,6 @@ only the updates to dir/sub.
 Also tested are "git add -u" without limiting, and "git add -u"
 without contents changes, and other conditions'
 
-TEST_PASSES_SANITIZE_LEAK=true
 . ./test-lib.sh
 
 test_expect_success setup '
@@ -41,20 +40,38 @@ test_expect_success update '
 '
 
 test_expect_success 'update noticed a removal' '
-	test "$(git ls-files dir1/sub1)" = ""
+	git ls-files dir1/sub1 >out &&
+	test_must_be_empty out
 '
 
 test_expect_success 'update touched correct path' '
-	test "$(git diff-files --name-status dir2/sub3)" = ""
+	git diff-files --name-status dir2/sub3 >out &&
+	test_must_be_empty out
 '
 
 test_expect_success 'update did not touch other tracked files' '
-	test "$(git diff-files --name-status check)" = "M	check" &&
-	test "$(git diff-files --name-status top)" = "M	top"
+	echo "M	check" >expect &&
+	git diff-files --name-status check >actual &&
+	test_cmp expect actual &&
+
+	echo "M	top" >expect &&
+	git diff-files --name-status top >actual &&
+	test_cmp expect actual
 '
 
 test_expect_success 'update did not touch untracked files' '
-	test "$(git ls-files dir2/other)" = ""
+	git ls-files dir2/other >out &&
+	test_must_be_empty out
+'
+
+test_expect_success 'error out when passing untracked path' '
+	git reset --hard &&
+	echo content >>baz &&
+	echo content >>top &&
+	test_must_fail git add -u baz top 2>err &&
+	test_grep -e "error: pathspec .baz. did not match any file(s) known to git" err &&
+	git diff --cached --name-only >actual &&
+	test_must_be_empty actual
 '
 
 test_expect_success 'cache tree has not been corrupted' '
@@ -76,9 +93,8 @@ test_expect_success 'update from a subdirectory' '
 '
 
 test_expect_success 'change gets noticed' '
-
-	test "$(git diff-files --name-status dir1)" = ""
-
+	git diff-files --name-status dir1 >out &&
+	test_must_be_empty out
 '
 
 test_expect_success 'non-qualified update in subdir updates from the root' '
@@ -103,7 +119,8 @@ test_expect_success 'replace a file with a symlink' '
 test_expect_success 'add everything changed' '
 
 	git add -u &&
-	test -z "$(git diff-files)"
+	git diff-files >out &&
+	test_must_be_empty out
 
 '
 
@@ -111,7 +128,8 @@ test_expect_success 'touch and then add -u' '
 
 	touch check &&
 	git add -u &&
-	test -z "$(git diff-files)"
+	git diff-files >out &&
+	test_must_be_empty out
 
 '
 
@@ -119,7 +137,8 @@ test_expect_success 'touch and then add explicitly' '
 
 	touch check &&
 	git add check &&
-	test -z "$(git diff-files)"
+	git diff-files >out &&
+	test_must_be_empty out
 
 '
 
@@ -185,6 +204,17 @@ test_expect_success '"add -u non-existent" should fail' '
 	test_must_fail git add -u non-existent &&
 	git ls-files >actual &&
 	! grep "non-existent" actual
+'
+
+test_expect_success '"commit -a" implies "add -u" if index becomes empty' '
+	git rm -rf \* &&
+	git commit -m clean-slate &&
+	test_commit file1 &&
+	rm file1.t &&
+	test_tick &&
+	git commit -a -m remove &&
+	git ls-tree HEAD: >out &&
+	test_must_be_empty out
 '
 
 test_done
